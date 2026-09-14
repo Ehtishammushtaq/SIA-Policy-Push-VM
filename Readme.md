@@ -29,8 +29,8 @@ Edit `config.json`:
 
 ```json
 "identity": {
-  "tenant_url": "https://acb4573.id.cyberark.cloud",
-  "client_id":  "apitest@cyberark.cloud.43192",
+  "tenant_url": "https://<tenant>.id.cyberark.cloud",
+  "client_id":  "apitest@cyberark.cloud.xxxxx",
   "secret_env": "CYBERARK_CLIENT_SECRET",
   "secret":     ""
 },
