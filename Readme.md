@@ -15,7 +15,7 @@ Everything else is configuration. Nothing to remember, no flags.
 push_policy.py      the only script you run
 config.json         credentials, URLs, and all defaults
 uap_policies.csv    the policies. this is what you edit.
-principals.json     OUTPUT. audit artifact, regenerated each run. do not edit.
+principals.json     OUTPUT. audit artifact, regenerated each run. do not edit..
 unresolved.txt      OUTPUT. written only when a principal fails to resolve.
 ```
 
@@ -34,7 +34,7 @@ Edit `config.json`:
   "secret_env": "CYBERARK_CLIENT_SECRET",
   "secret":     ""
 },
-"uap": { "url": "https://engdeltek.uap.cyberark.cloud/api" }
+"uap": { "url": "https://<subdomain>.uap.cyberark.cloud/api" }
 ```
 
 Secret resolution order: `identity.secret` literal, then the env var named by
