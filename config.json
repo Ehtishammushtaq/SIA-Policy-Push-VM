@@ -1,0 +1,52 @@
+{
+  "identity": {
+    "tenant_url": "https://<tenant>.id.cyberark.cloud",
+    "client_id": "apitest@cyberark.cloud.xxxxx",
+    "secret_env": "CYBERARK_CLIENT_SECRET",
+    "secret": ""
+  },
+  "uap": {
+    "subdomain": "<UAP>",
+    "url": "https://<UAP>.uap.cyberark.cloud/api"
+  },
+  "input": {
+    "policies_file": "uap_policies.csv"
+  },
+  "output": {
+    "principals_file": "principals.json",
+    "unresolved_file": "unresolved.txt"
+  },
+  "options": {
+    "day_base": "sunday",
+    "keep_input_name": true,
+    "role_directory_uuid": null,
+    "role_directory_name": null
+  },
+  "policy_defaults": {
+    "location_type": "FQDN/IP",
+    "fqdn_operator": "WILDCARD",
+    "status": "Active",
+    "time_zone": "America/Chicago",
+    "days_of_week": [
+      "Mon",
+      "Tue",
+      "Wed",
+      "Thu",
+      "Fri"
+    ],
+    "from_hour": "07:00",
+    "to_hour": "19:00",
+    "max_session_duration": 4,
+    "idle_time": 15,
+    "rdp_scope": "local",
+    "rdp_groups": [
+      "Administrators"
+    ]
+  },
+  "directory_labels": {
+    "CDS": "CyberArk Cloud Directory",
+    "AdProxy": "Active Directory",
+    "FDS": "Federated Directory Service",
+    "LDAP": "LDAP Directory"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "ehtishammustaq@cyberark.cloud.43192": {
+    "id": "99812fb3-4cae-45e6-8fcb-76238ceb875e",
+    "name": "ehtishammustaq@cyberark.cloud.43192",
+    "type": "USER",
+    "sourceDirectoryName": "CyberArk Cloud Directory",
+    "sourceDirectoryId": "09B9A9B0-6CE8-465F-AB03-65766D33B05E"
+  },
+  "DpaAdmin": {
+    "id": "DPA_Admin_Role",
+    "name": "DpaAdmin",
+    "type": "ROLE"
+  }
+}
