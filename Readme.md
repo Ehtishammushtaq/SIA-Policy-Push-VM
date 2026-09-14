@@ -5,6 +5,8 @@ Push CyberArk UAP virtual machine (ZSP) policies. Two commands.
 ```powershell
 python push_policy.py              # plan: build, resolve, diff, report. NO WRITES.
 python push_policy.py --apply      # create or update
+
+python push_policy.py --discover <tenentname> #
 ```
 
 Everything else is configuration. Nothing to remember, no flags.
