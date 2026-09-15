@@ -42,6 +42,32 @@ CONFIG_NAME = "config.json"
 # This endpoint has lived in both namespaces depending on Identity version.
 DISCOVERY_URL = "https://platform-discovery.cyberark.cloud/api/v2/services/subdomain/{sub}"
 
+# TLS verification target. True = use certifi's bundle. A path = use that CA
+# bundle (corporate TLS inspection). False = no verification, last resort.
+VERIFY: Any = True
+
+
+def set_verify(value: Any) -> None:
+    global VERIFY
+    VERIFY = value
+    if value is False:
+        print("warning: TLS certificate verification is DISABLED "
+              "(network.verify=false in config.json)", file=sys.stderr)
+
+
+def ssl_hint() -> str:
+    return (
+        "\nTLS verification failed. Your network is almost certainly doing TLS\n"
+        "inspection, so Python does not trust the certificate your browser does.\n"
+        "Pick one:\n"
+        "  1. Use the Windows trust store (easiest):\n"
+        "       python -m pip install pip-system-certs\n"
+        "  2. Point at the corporate CA bundle in config.json:\n"
+        '       "network": { "ca_bundle": "C:\\\\certs\\\\corp-ca.pem" }\n'
+        "  3. Last resort, disable verification in config.json:\n"
+        '       "network": { "verify": false }'
+    )
+
 DIRECTORY_QUERY_PATHS = ["/UserMgmt/DirectoryServiceQuery",
                          "/Core/DirectoryServiceQuery",
                          "/redrock/query"]
@@ -105,6 +131,8 @@ class Config:
     role_directory_name: str | None
     policy_defaults: dict[str, Any]
     directory_labels: dict[str, str]
+    ca_bundle: str | None
+    verify_tls: bool
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -158,6 +186,8 @@ class Config:
             role_directory_name=opts.get("role_directory_name") or None,
             policy_defaults=raw.get("policy_defaults") or {},
             directory_labels=raw.get("directory_labels") or {},
+            ca_bundle=(raw.get("network") or {}).get("ca_bundle") or None,
+            verify_tls=bool((raw.get("network") or {}).get("verify", True)),
         )
 
     def secret(self) -> str:
@@ -180,6 +210,11 @@ class Config:
                 f"  set ${self.secret_env or 'CYBERARK_CLIENT_SECRET'}, or put the value "
                 'in config.json under identity.secret'
             ) from None
+
+    def verify(self) -> Any:
+        if not self.verify_tls:
+            return False
+        return self.ca_bundle or True
 
     def day_map(self) -> dict[str, int]:
         names = DAYS_MONDAY_BASE if self.day_base == "monday" else DAYS_SUNDAY_BASE
@@ -208,6 +243,7 @@ class IdentityClient:
         self._client_id = client_id
         self._secret = secret
         self._session = requests.Session()
+        self._session.verify = VERIFY
         self._token: str | None = None
         self._query_path_cache: str | None = None
 
@@ -687,7 +723,7 @@ def discover_services(subdomain: str) -> dict[str, str]:
     error on some of them.
     """
     url = DISCOVERY_URL.format(sub=subdomain)
-    resp = requests.get(url, timeout=TIMEOUT)
+    resp = requests.get(url, timeout=TIMEOUT, verify=VERIFY)
     if resp.status_code >= 400:
         raise PushError(f"discovery for {subdomain!r} -> {resp.status_code}: "
                         f"{resp.text[:300]}")
@@ -708,6 +744,9 @@ def discover_services(subdomain: str) -> dict[str, str]:
 def cmd_discover(subdomain: str) -> int:
     try:
         services = discover_services(subdomain)
+    except requests.exceptions.SSLError as exc:
+        print(f"{exc}\n{ssl_hint()}", file=sys.stderr)
+        return 2
     except (PushError, requests.RequestException, ValueError) as exc:
         print(f"{exc}", file=sys.stderr)
         return 2
@@ -743,6 +782,7 @@ class UapClient:
         self.base = base_url.rstrip("/")
         self.identity = identity
         self._session = requests.Session()
+        self._session.verify = VERIFY
 
     def _call(self, method: str, path: str, **kw) -> requests.Response:
         headers = {"Authorization": f"Bearer {self.identity.token}",
@@ -803,6 +843,11 @@ class UapClient:
 
 # Fields the server owns. Never overwrite them on update.
 SERVER_OWNED_METADATA = {"policyId", "createdBy", "createdOn", "updatedOn", "updatedBy"}
+
+# The API does not preserve the order of these lists, so comparing them
+# positionally reports a difference on every run and the plan never settles.
+ORDER_INSENSITIVE = {"conditions.accessWindow.daysOfTheWeek",
+                     "metadata.policyTags"}
 # Fields this tool derives from the CSV. Everything else on a live policy is
 # carried through untouched.
 OWNED_METADATA = ("name", "description", "policyTags", "timeZone",
@@ -847,6 +892,11 @@ def _leaf_diff(live: Any, desired: Any, path: str, out: list[str],
                 continue
             _leaf_diff(live.get(key), desired.get(key),
                        f"{path}.{key}" if path else key, out, skip)
+        return
+    if path in ORDER_INSENSITIVE and isinstance(live, list) and isinstance(desired, list):
+        if sorted(map(str, live)) == sorted(map(str, desired)):
+            return
+        out.append(f"    {path}: {_short(sorted(live))} -> {_short(sorted(desired))}")
         return
     if live != desired:
         out.append(f"    {path}: {_short(live)} -> {_short(desired)}")
@@ -898,12 +948,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.discover is not None:
         sub = args.discover
+        try:
+            raw = json.loads((script_dir / args.config).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        net = raw.get("network") or {}
+        set_verify(False if net.get("verify") is False
+                   else (net.get("ca_bundle") or True))
         if not sub:
-            try:
-                raw = json.loads((script_dir / args.config).read_text(encoding="utf-8"))
-                sub = str((raw.get("uap") or {}).get("subdomain") or "").strip()
-            except (OSError, json.JSONDecodeError):
-                sub = ""
+            sub = str((raw.get("uap") or {}).get("subdomain") or "").strip()
         if not sub:
             print("usage: push_policy.py --discover <subdomain>\n"
                   '  or set "uap": { "subdomain": "..." } in config.json',
@@ -916,6 +969,8 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+    set_verify(cfg.verify())
 
     mode = "APPLY" if args.apply else "PLAN (no writes)"
     print(f"mode     : {mode}")
@@ -970,6 +1025,9 @@ def main(argv: list[str] | None = None) -> int:
         identity = IdentityClient(cfg.tenant_url, cfg.client_id, cfg.secret())
         identity.authenticate()
         dir_map = identity.directory_map(cfg.directory_labels)
+    except requests.exceptions.SSLError as exc:
+        print(f"\n{exc}\n{ssl_hint()}", file=sys.stderr)
+        return 2
     except (ConfigError, ResolveError, requests.RequestException) as exc:
         print(f"\n{exc}", file=sys.stderr)
         return 2
