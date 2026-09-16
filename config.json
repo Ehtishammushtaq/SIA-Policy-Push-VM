@@ -1,13 +1,13 @@
 {
   "identity": {
-    "tenant_url": "https://<tenant>.id.cyberark.cloud",
-    "client_id": "apitest@cyberark.cloud.xxxxx",
+    "tenant_url": "https://acb4573.id.cyberark.cloud",
+    "client_id": "apitest@cyberark.cloud.43192",
     "secret_env": "CYBERARK_CLIENT_SECRET",
-    "secret": ""
+    "secret": "PUT_THE_ROTATED_SECRET_HERE"
   },
   "uap": {
-    "subdomain": "<UAP>",
-    "url": "https://<UAP>.uap.cyberark.cloud/api"
+    "subdomain": "delteksandbox",
+    "url": "https://delteksandbox.uap.cyberark.cloud/api"
   },
   "input": {
     "policies_file": "uap_policies.csv"
@@ -20,7 +20,8 @@
     "day_base": "sunday",
     "keep_input_name": true,
     "role_directory_uuid": null,
-    "role_directory_name": null
+    "role_directory_name": null,
+    "all_day_representation": "empty"
   },
   "policy_defaults": {
     "location_type": "FQDN/IP",
@@ -28,25 +29,32 @@
     "status": "Active",
     "time_zone": "America/Chicago",
     "days_of_week": [
+      "Sun",
       "Mon",
       "Tue",
       "Wed",
       "Thu",
-      "Fri"
+      "Fri",
+      "Sat"
     ],
-    "from_hour": "07:00",
-    "to_hour": "19:00",
-    "max_session_duration": 4,
+    "from_hour": "",
+    "to_hour": "",
+    "max_session_duration": 8,
     "idle_time": 15,
     "rdp_scope": "local",
     "rdp_groups": [
       "Administrators"
-    ]
+    ],
+    "all_day": "true"
   },
   "directory_labels": {
     "CDS": "CyberArk Cloud Directory",
     "AdProxy": "Active Directory",
     "FDS": "Federated Directory Service",
     "LDAP": "LDAP Directory"
+  },
+  "network": {
+    "ca_bundle": null,
+    "verify": true
   }
 }

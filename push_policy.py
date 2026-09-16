@@ -129,6 +129,7 @@ class Config:
     keep_input_name: bool
     role_directory_uuid: str | None
     role_directory_name: str | None
+    all_day_repr: str
     policy_defaults: dict[str, Any]
     directory_labels: dict[str, str]
     ca_bundle: str | None
@@ -167,6 +168,10 @@ class Config:
         day_base = str(opts.get("day_base", "sunday")).lower()
         if day_base not in ("sunday", "monday"):
             problems.append('options.day_base must be "sunday" or "monday"')
+        adr = str(opts.get("all_day_representation", "null")).lower()
+        if adr not in ("null", "empty", "omit"):
+            problems.append('options.all_day_representation must be '
+                            '"null", "empty" or "omit"')
         if problems:
             raise ConfigError(f"{path.name} needs fixing:\n  - " + "\n  - ".join(problems))
 
@@ -184,6 +189,7 @@ class Config:
             keep_input_name=bool(opts.get("keep_input_name", True)),
             role_directory_uuid=opts.get("role_directory_uuid") or None,
             role_directory_name=opts.get("role_directory_name") or None,
+            all_day_repr=str(opts.get("all_day_representation", "null")).lower(),
             policy_defaults=raw.get("policy_defaults") or {},
             directory_labels=raw.get("directory_labels") or {},
             ca_bundle=(raw.get("network") or {}).get("ca_bundle") or None,
@@ -584,12 +590,12 @@ def build_bodies(rows: list[dict[str, str]],
             ssh_user = row.get("ssh_username") or d.get("ssh_username") or ""
             if ssh_user:
                 connect_as["ssh"] = {"username": ssh_user}
-            if _bool(row.get("rdp"), bool(d.get("rdp", False))) or row.get("rdp_scope"):
+            if _bool(row.get("rdp"), _bool(d.get("rdp"), False)) or row.get("rdp_scope"):
                 scope = (row.get("rdp_scope") or d.get("rdp_scope") or "local").lower()
                 groups = _split(row.get("rdp_groups", "")) or list(
                     d.get("rdp_groups") or ["Administrators"])
                 dgroups = _split(row.get("rdp_domain_groups", ""))
-                recon = _bool(row.get("rdp_reconnect"), bool(d.get("rdp_reconnect", False)))
+                recon = _bool(row.get("rdp_reconnect"), _bool(d.get("rdp_reconnect"), False))
                 if scope == "local":
                     if dgroups:
                         raise BuildError("rdp_domain_groups requires rdp_scope=domain")
@@ -615,8 +621,23 @@ def build_bodies(rows: list[dict[str, str]],
                 days = sorted(days_lookup[x] for x in day_names)
             else:
                 days = list(range(7))
-            from_hour = _hhmm(row.get("from_hour") or d.get("from_hour") or "00:00", "from_hour")
-            to_hour = _hhmm(row.get("to_hour") or d.get("to_hour") or "23:59", "to_hour")
+            # "All Day" in the UI is null hours, NOT 00:00-23:59. Sending
+            # 00:00-23:59 selects "Specific time" and the UI snaps each value
+            # to the nearest hour. Blank cells, or all_day=true, mean all day.
+            all_day = _bool(row.get("all_day"), _bool(d.get("all_day"), False))
+            raw_from = row.get("from_hour") or d.get("from_hour") or ""
+            raw_to = row.get("to_hour") or d.get("to_hour") or ""
+            if all_day or not (raw_from and raw_to):
+                # How the API wants "All Day" is not documented and the GET
+                # response (null) does not prove what POST accepts: CyberArk's
+                # own Go SDK types these as plain strings, which cannot be null
+                # and marshal as "". Switchable so it can be tested directly.
+                from_hour = to_hour = (None if cfg.all_day_repr == "null"
+                                       else "" if cfg.all_day_repr == "empty"
+                                       else "OMIT")
+            else:
+                from_hour = _hhmm(raw_from, "from_hour")
+                to_hour = _hhmm(raw_to, "to_hour")
             duration = _int(row.get("max_session_duration"),
                             int(d.get("max_session_duration", 2)))
             idle = _int(row.get("idle_time"), int(d.get("idle_time", 10)))
@@ -624,9 +645,12 @@ def build_bodies(rows: list[dict[str, str]],
                 raise BuildError(f"max_session_duration must be 1..{MAX_SESSION_HOURS}")
             if not 0 < idle <= MAX_IDLE_MIN:
                 raise BuildError(f"idle_time must be 1..{MAX_IDLE_MIN}")
+            window: dict[str, Any] = {"daysOfTheWeek": days}
+            if from_hour != "OMIT":
+                window["fromHour"] = from_hour
+                window["toHour"] = to_hour
             conditions = {
-                "accessWindow": {"daysOfTheWeek": days,
-                                 "fromHour": from_hour, "toHour": to_hour},
+                "accessWindow": window,
                 "maxSessionDuration": duration,
                 "idleTime": idle,
             }
@@ -939,6 +963,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", default=CONFIG_NAME)
     ap.add_argument("--discover", metavar="SUBDOMAIN", nargs="?", const="",
                     help="list this tenant's real service URLs and exit")
+    ap.add_argument("--dump-body", action="store_true",
+                    help="print the exact JSON this would send, then exit")
     ap.add_argument("--dump-policy", metavar="NAME",
                     help="print a live policy as JSON and exit "
                          "(use it to see the exact shape the tenant stores)")
@@ -1013,6 +1039,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"built {len(bodies)} polic{'y' if len(bodies) == 1 else 'ies'} "
           f"from {len(rows)} row(s)")
+
+    if args.dump_body and not args.apply:
+        print(json.dumps(bodies, indent=2))
+        print("\n(principals are still names here; they are resolved next)",
+              file=sys.stderr)
+        return 0
 
     # --- resolve principals ----------------------------------------------
     names: list[str] = []
