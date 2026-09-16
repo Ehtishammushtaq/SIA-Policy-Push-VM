@@ -89,6 +89,11 @@ MAX_PATTERN = 300
 MAX_SESSION_HOURS = 24
 MAX_IDLE_MIN = 120
 
+# Placeholder window used only to get an all-day policy past POST
+# validation; it is replaced with nulls by the follow-up PUT.
+ALL_DAY_SEED_FROM = "00:00"
+ALL_DAY_SEED_TO = "23:59"
+
 # daysOfTheWeek is a list of INTEGERS. CyberArk does not document which integer
 # is which day. Set options.day_base in config.json. Verify against the UI once.
 DAYS_SUNDAY_BASE = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
@@ -130,6 +135,7 @@ class Config:
     role_directory_uuid: str | None
     role_directory_name: str | None
     all_day_repr: str
+    body_style: str
     policy_defaults: dict[str, Any]
     directory_labels: dict[str, str]
     ca_bundle: str | None
@@ -172,6 +178,9 @@ class Config:
         if adr not in ("null", "empty", "omit"):
             problems.append('options.all_day_representation must be '
                             '"null", "empty" or "omit"')
+        bs = str(opts.get("body_style", "merge")).lower()
+        if bs not in ("merge", "gui"):
+            problems.append('options.body_style must be "merge" or "gui"')
         if problems:
             raise ConfigError(f"{path.name} needs fixing:\n  - " + "\n  - ".join(problems))
 
@@ -190,6 +199,7 @@ class Config:
             role_directory_uuid=opts.get("role_directory_uuid") or None,
             role_directory_name=opts.get("role_directory_name") or None,
             all_day_repr=str(opts.get("all_day_representation", "null")).lower(),
+            body_style=str(opts.get("body_style", "merge")).lower(),
             policy_defaults=raw.get("policy_defaults") or {},
             directory_labels=raw.get("directory_labels") or {},
             ca_bundle=(raw.get("network") or {}).get("ca_bundle") or None,
@@ -878,6 +888,35 @@ OWNED_METADATA = ("name", "description", "policyTags", "timeZone",
                   "timeFrame", "policyEntitlement")
 
 
+# Exactly the fields the GUI's own PUT carries, captured from DevTools. It
+# sends a leaner body than a merge does: no delegationClassification, no
+# override* flags, no recording, and status without link.
+def gui_style_body(live: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
+    meta = dict(desired["metadata"])
+    live_meta = live.get("metadata") or {}
+    if live_meta.get("policyId"):
+        meta["policyId"] = live_meta["policyId"]
+    live_status = live_meta.get("status") if isinstance(live_meta.get("status"), dict) else {}
+    meta["status"] = {"status": desired["metadata"]["status"]["status"],
+                      "statusCode": live_status.get("statusCode", "200"),
+                      "statusDescription": live_status.get("statusDescription", "All good")}
+
+    cond = desired["conditions"]
+    conditions = {"accessWindow": cond["accessWindow"],
+                  "idleTime": cond.get("idleTime"),
+                  "maxSessionDuration": cond.get("maxSessionDuration")}
+
+    # The GUI spells out domainEphemeralUser: null alongside localEphemeralUser.
+    behavior = copy.deepcopy(desired["behavior"])
+    rdp = (behavior.get("connectAs") or {}).get("rdp")
+    if isinstance(rdp, dict):
+        rdp.setdefault("domainEphemeralUser", None)
+        rdp.setdefault("localEphemeralUser", None)
+
+    return {"metadata": meta, "behavior": behavior, "conditions": conditions,
+            "principals": desired["principals"], "targets": desired["targets"]}
+
+
 def merge_for_update(live: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
     """Overlay the CSV-derived fields onto the live policy.
 
@@ -1160,10 +1199,37 @@ def main(argv: list[str] | None = None) -> int:
     for action, body, name, pid in plan:
         try:
             if action == "create":
-                result = uap.create(body)
+                if cfg.body_style == "gui":
+                    body = gui_style_body({}, body)
+
+                # POST rejects null fromHour/toHour (UAP1005) but PUT accepts
+                # them, which is how the GUI's "All Day" is stored. So an
+                # all-day policy is created with placeholder hours and then
+                # immediately updated to null.
+                window = ((body.get("conditions") or {}).get("accessWindow") or {})
+                needs_all_day = ("fromHour" in window and window["fromHour"] is None)
+                if needs_all_day:
+                    seed = copy.deepcopy(body)
+                    seed["conditions"]["accessWindow"]["fromHour"] = ALL_DAY_SEED_FROM
+                    seed["conditions"]["accessWindow"]["toHour"] = ALL_DAY_SEED_TO
+                    result = uap.create(seed)
+                else:
+                    result = uap.create(body)
+
                 new_id = (result.get("policyId") or result.get("id")
                           or (result.get("metadata") or {}).get("policyId") or "")
                 print(f"  created  {name}  {new_id}")
+
+                if needs_all_day:
+                    if not new_id:
+                        print(f"  !!       {name}: created, but no policyId came back, "
+                              f"so All Day could not be applied. Re-run to fix it.",
+                              file=sys.stderr)
+                    else:
+                        follow = copy.deepcopy(body)
+                        follow.setdefault("metadata", {})["policyId"] = new_id
+                        uap.update(new_id, follow)
+                        print(f"           set All Day on {name}")
             else:
                 if not pid:
                     raise PushError("live policy has no id field; cannot update")
