@@ -17,6 +17,7 @@
     "unresolved_file": "unresolved.txt"
   },
   "options": {
+    "mode": "merge",
     "day_base": "sunday",
     "keep_input_name": true,
     "role_directory_uuid": null,

@@ -1,3 +1,3 @@
-policy_name,description,status,location_type,fqdn_operator,computername_pattern,domain,ip_addresses,ip_operator,logical_name,principals,ssh_username,rdp,rdp_scope,rdp_groups,rdp_domain_groups,rdp_reconnect,days_of_week,from_hour,to_hour,max_session_duration,idle_time,time_zone,policy_tags
-WIN-PROD-APP-INSF,app tier admin RDP,Active,FQDN/IP,EXACTLY,testserver,engdeltek.local,,,,ehtishammustaq@cyberark.cloud.43192,root,FALSE,,,,,Mon;Tue;Wed;Thu;Fri,,,4,15,America/Chicago,test;windows
-WIN-PROD-APP-INSFT,app tier admin RDP,Active,FQDN/IP,EXACTLY,testserver2,engdeltek.local,,,,DpaAdmin,root,FALSE,,,,,Mon;Tue;Wed;Thu;Fri,,,4,15,America/Chicago,test;windows
+policy_name,action,description,status,location_type,fqdn_operator,computername_pattern,domain,ip_addresses,ip_operator,logical_name,principals,ssh_username,rdp,rdp_scope,rdp_groups,rdp_domain_groups,rdp_reconnect,days_of_week,from_hour,to_hour,max_session_duration,idle_time,time_zone,policy_tags
+WIN-PROD-APP-INSF,add,app tier admin RDP,Active,FQDN/IP,EXACTLY,testserver,engdeltek.local,,,,ehtishammustaq@cyberark.cloud.43192,root,FALSE,,,,,Mon;Tue;Wed;Thu;Fri,,,4,15,America/Chicago,test;windows
+WIN-PROD-APP-INSFT,add,app tier admin RDP,Active,FQDN/IP,EXACTLY,testserver2,engdeltek.local,,,,DpaAdmin,root,FALSE,,,,,Mon;Tue;Wed;Thu;Fri,,,4,15,America/Chicago,test;windows

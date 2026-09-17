@@ -4,7 +4,8 @@ Push CyberArk UAP virtual machine (ZSP) policies. Two commands.
 
 ```powershell
 python push_policy.py              # plan: build, resolve, diff, report. NO WRITES.
-python push_policy.py --apply      # create or update
+python push_policy.py --apply      # create or update (MERGE mode)
+python push_policy.py --replace    # plan in REPLACE mode (CSV is the full truth)
 
 python push_policy.py --discover <tenentname> #
 ```
@@ -59,11 +60,40 @@ name *with* the tenant suffix. No OAuth web app registration is needed;
 2. Authenticate, resolve every principal name to a directory UUID.
    Unresolved principal means nothing is pushed.
 3. `GET /policies`, match by name, diff.
-4. Print CREATE / UPDATE / already matches per policy.
+4. For existing policies, `GET /policies/{id}` and apply the rows on top (merge)
+   or diff against the CSV (replace). Print CREATE / UPDATE / already matches.
 5. Stop, unless `--apply`.
 
 Safe to re-run. Matching policies are skipped, so `--apply` twice does not
 create duplicates.
+
+## Merge vs replace
+
+**Merge (default).** Each row changes only what it names. Anything already on
+the live policy stays. The CSV only needs today's change; clear rows once applied.
+
+| action | on an existing policy | policy does not exist |
+|---|---|---|
+| `add` or blank | adds the host / IP / principal if missing. Non-blank setting cells (days, hours, duration, idle, ssh/rdp, description, status, tags, time zone) overwrite that one field. Blank cells leave the live value alone. | created, blanks filled from `policy_defaults` |
+| `remove` | removes the host / IP / principal. `fqdn_operator`, `domain`, `logical_name` narrow the match only if filled. Setting cells are ignored. | row skipped |
+
+Examples:
+
+```
+policy_name,action,computername_pattern,domain,principals
+WIN-PROD-APP,add,testserver3,engdeltek.local,
+WIN-PROD-APP,remove,testserver,,
+WIN-PROD-APP,add,,,jdoe@corp
+WIN-PROD-APP,remove,,,olduser@corp
+```
+
+Safety: a change that would leave a policy with no targets or no principals is
+blocked and nothing is pushed. Deleting a whole policy is a UI action.
+Removing something that is not on the policy prints a warning, not an error.
+
+**Replace (`--replace`, or `"options": {"mode": "replace"}`).** Old behaviour:
+the CSV is the full definition and anything not in it is removed. `remove` rows
+are rejected in this mode.
 
 ## The CSV
 
@@ -73,7 +103,8 @@ and principals into one policy.
 | column | notes |
 |---|---|
 | `policy_name` | required. the grouping key. |
-| `principals` | required. `;` separated names. resolved automatically. |
+| `action` | `add` (default when blank) or `remove`. merge mode only. |
+| `principals` | `;` separated names. resolved automatically. required to create. |
 | `computername_pattern` + `domain` | FQDN targeting |
 | `ip_addresses` + `logical_name` | IP targeting. `;` separated addresses. |
 | `fqdn_operator` | EXACTLY, WILDCARD, PREFIX, SUFFIX, CONTAINS. UI calls EXACTLY "Is". |

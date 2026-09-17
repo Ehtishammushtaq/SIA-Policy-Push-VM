@@ -7,6 +7,10 @@ Two commands. That is the whole operator surface.
     python push_policy.py            plan: resolve, build, diff, report. NO WRITES.
     python push_policy.py --apply    create or update the policies
 
+Default is MERGE: each CSV row adds (action blank/add) or removes
+(action=remove) only what it names. Everything already on the policy stays.
+--replace restores the old behaviour where the CSV is the full truth.
+
 Everything else lives in config.json: credentials, tenant URLs, the CSV to read,
 and the defaults that fill any blank cell. Policies are edited in the CSV.
 
@@ -136,6 +140,7 @@ class Config:
     role_directory_name: str | None
     all_day_repr: str
     body_style: str
+    mode: str
     policy_defaults: dict[str, Any]
     directory_labels: dict[str, str]
     ca_bundle: str | None
@@ -181,6 +186,9 @@ class Config:
         bs = str(opts.get("body_style", "merge")).lower()
         if bs not in ("merge", "gui"):
             problems.append('options.body_style must be "merge" or "gui"')
+        md = str(opts.get("mode", "merge")).lower()
+        if md not in ("merge", "replace"):
+            problems.append('options.mode must be "merge" or "replace"')
         if problems:
             raise ConfigError(f"{path.name} needs fixing:\n  - " + "\n  - ".join(problems))
 
@@ -200,6 +208,7 @@ class Config:
             role_directory_name=opts.get("role_directory_name") or None,
             all_day_repr=str(opts.get("all_day_representation", "null")).lower(),
             body_style=str(opts.get("body_style", "merge")).lower(),
+            mode=str(opts.get("mode", "merge")).lower(),
             policy_defaults=raw.get("policy_defaults") or {},
             directory_labels=raw.get("directory_labels") or {},
             ca_bundle=(raw.get("network") or {}).get("ca_bundle") or None,
@@ -542,180 +551,258 @@ def _hhmm(value: str, field: str) -> str:
     return f"{h:02d}:{m:02d}"
 
 
-def build_bodies(rows: list[dict[str, str]],
-                 cfg: Config) -> tuple[list[dict[str, Any]], list[str]]:
-    """Rows sharing policy_name merge their targets and principals."""
+
+# CSV action column. Blank means add.
+ACTIONS = {"add": "add", "+": "add", "remove": "remove", "delete": "remove",
+           "del": "remove", "rm": "remove", "-": "remove"}
+
+RDP_COLUMNS = ("rdp_scope", "rdp_groups", "rdp_domain_groups", "rdp_reconnect")
+
+
+def parse_row(row: dict[str, str], cfg: Config) -> dict[str, Any]:
+    """One CSV row -> a spec.
+
+    Every spec carries two views of the row:
+      full      values with config defaults filled in. Used to CREATE a policy
+                and in --replace mode.
+      explicit  only the cells that actually have a value. Used in merge mode
+                on an EXISTING policy, so a blank cell never overwrites what
+                is already on the tenant.
+    """
     d = cfg.policy_defaults
     days_lookup = cfg.day_map()
-    grouped: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
+
+    raw_action = (row.get("action") or "add").strip().lower()
+    action = ACTIONS.get(raw_action)
+    if action is None:
+        raise BuildError(f"action must be add or remove, got {raw_action!r}")
+
+    name = row.get("policy_name", "").strip()
+    if not name:
+        raise BuildError("policy_name is required")
+    if len(name) > MAX_NAME:
+        raise BuildError(f"policy_name exceeds {MAX_NAME} chars")
+
+    location = row.get("location_type") or d.get("location_type") or LOCATION_FQDN_IP
+    if location not in LOCATION_TYPES:
+        raise BuildError(f"location_type must be one of {sorted(LOCATION_TYPES)}")
+
+    pattern = row.get("computername_pattern", "").strip()
+    ips = _split(row.get("ip_addresses", ""))
+    principals = _split(row.get("principals", ""))
+
+    spec: dict[str, Any] = {"action": action, "name": name, "location": location,
+                            "fqdn_rules": [], "ip_rules": [], "principals": principals}
+
+    # ---- remove rows: match specs only, nothing else is read -------------
+    if action == "remove":
+        if not (pattern or ips or principals):
+            raise BuildError("remove row needs computername_pattern, ip_addresses "
+                             "or principals")
+        if pattern:
+            op = (row.get("fqdn_operator") or "").upper() or None
+            if op and op not in FQDN_OPERATORS:
+                raise BuildError(f"fqdn_operator must be one of {sorted(FQDN_OPERATORS)}")
+            spec["fqdn_rules"].append({"computernamePattern": pattern, "operator": op,
+                                       "domain": row.get("domain") or None})
+        if ips:
+            spec["ip_rules"].append({"ipAddresses": ips,
+                                     "logicalName": row.get("logical_name") or None})
+        return spec
+
+    # ---- add rows ---------------------------------------------------------
+    if pattern:
+        op = (row.get("fqdn_operator") or d.get("fqdn_operator") or "EXACTLY").upper()
+        if op not in FQDN_OPERATORS:
+            raise BuildError(f"fqdn_operator must be one of {sorted(FQDN_OPERATORS)}")
+        if len(pattern) > MAX_PATTERN:
+            raise BuildError(f"computername_pattern exceeds {MAX_PATTERN} chars")
+        rule: dict[str, Any] = {"operator": op, "computernamePattern": pattern}
+        dom = row.get("domain") or d.get("domain") or ""
+        if dom:
+            rule["domain"] = dom
+        spec["fqdn_rules"].append(rule)
+    if ips:
+        op = (row.get("ip_operator") or "EXACTLY").upper()
+        if op not in IP_OPERATORS:
+            raise BuildError(f"ip_operator must be one of {sorted(IP_OPERATORS)}")
+        logical = row.get("logical_name") or d.get("logical_name") or ""
+        if not logical:
+            raise BuildError("ip_addresses requires logical_name")
+        spec["ip_rules"].append({"operator": op, "ipAddresses": ips, "logicalName": logical})
+
+    explicit: dict[str, Any] = {"accessWindow": {}, "conditions": {},
+                                "connectAs": {}, "metadata": {}}
+
+    # behavior
+    connect_as: dict[str, Any] = {}
+    ssh_user = row.get("ssh_username") or d.get("ssh_username") or ""
+    if ssh_user:
+        connect_as["ssh"] = {"username": ssh_user}
+        if row.get("ssh_username"):
+            explicit["connectAs"]["ssh"] = connect_as["ssh"]
+    row_rdp = _bool(row.get("rdp")) or any(row.get(c) for c in RDP_COLUMNS)
+    if row_rdp or _bool(d.get("rdp"), False):
+        scope = (row.get("rdp_scope") or d.get("rdp_scope") or "local").lower()
+        groups = _split(row.get("rdp_groups", "")) or list(
+            d.get("rdp_groups") or ["Administrators"])
+        dgroups = _split(row.get("rdp_domain_groups", ""))
+        recon = _bool(row.get("rdp_reconnect"), _bool(d.get("rdp_reconnect"), False))
+        if scope == "local":
+            if dgroups:
+                raise BuildError("rdp_domain_groups requires rdp_scope=domain")
+            connect_as["rdp"] = {"localEphemeralUser": {
+                "assignGroups": groups, "enableEphemeralUserReconnect": recon}}
+        elif scope == "domain":
+            connect_as["rdp"] = {"domainEphemeralUser": {
+                "assignGroups": groups, "assignDomainGroups": dgroups,
+                "enableEphemeralUserReconnect": recon}}
+        else:
+            raise BuildError("rdp_scope must be 'local' or 'domain'")
+        if row_rdp:
+            explicit["connectAs"]["rdp"] = connect_as["rdp"]
+
+    # conditions
+    day_names = _split(row.get("days_of_week", "")) or list(d.get("days_of_week") or [])
+    if day_names:
+        bad = [x for x in day_names if x not in days_lookup]
+        if bad:
+            raise BuildError(f"unknown days {bad}; expected from {list(days_lookup)}")
+        days = sorted(days_lookup[x] for x in day_names)
+    else:
+        days = list(range(7))
+    all_day = _bool(row.get("all_day"), _bool(d.get("all_day"), False))
+    raw_from = row.get("from_hour") or d.get("from_hour") or ""
+    raw_to = row.get("to_hour") or d.get("to_hour") or ""
+    if all_day or not (raw_from and raw_to):
+        from_hour = to_hour = (None if cfg.all_day_repr == "null"
+                               else "" if cfg.all_day_repr == "empty" else "OMIT")
+    else:
+        from_hour = _hhmm(raw_from, "from_hour")
+        to_hour = _hhmm(raw_to, "to_hour")
+    duration = _int(row.get("max_session_duration"), int(d.get("max_session_duration", 2)))
+    idle = _int(row.get("idle_time"), int(d.get("idle_time", 10)))
+    if not 0 < duration <= MAX_SESSION_HOURS:
+        raise BuildError(f"max_session_duration must be 1..{MAX_SESSION_HOURS}")
+    if not 0 < idle <= MAX_IDLE_MIN:
+        raise BuildError(f"idle_time must be 1..{MAX_IDLE_MIN}")
+    window: dict[str, Any] = {"daysOfTheWeek": days}
+    if from_hour != "OMIT":
+        window["fromHour"] = from_hour
+        window["toHour"] = to_hour
+    conditions = {"accessWindow": window, "maxSessionDuration": duration, "idleTime": idle}
+
+    if row.get("days_of_week"):
+        explicit["accessWindow"]["daysOfTheWeek"] = days
+    if (row.get("from_hour") or row.get("to_hour") or row.get("all_day")) and from_hour != "OMIT":
+        explicit["accessWindow"]["fromHour"] = from_hour
+        explicit["accessWindow"]["toHour"] = to_hour
+    if row.get("max_session_duration"):
+        explicit["conditions"]["maxSessionDuration"] = duration
+    if row.get("idle_time"):
+        explicit["conditions"]["idleTime"] = idle
+
+    # metadata
+    status = row.get("status") or d.get("status") or "Active"
+    if status not in STATUSES:
+        raise BuildError(f"status must be one of {sorted(STATUSES)}")
+    tags = _split(row.get("policy_tags", "")) or list(d.get("policy_tags") or [])
+    description = (row.get("description") or d.get("description") or "")[:MAX_DESCRIPTION]
+    time_zone = row.get("time_zone") or d.get("time_zone") or "UTC"
+    time_frame = {"fromTime": row.get("start_date") or None,
+                  "toTime": row.get("end_date") or None}
+    if row.get("description"):
+        explicit["metadata"]["description"] = description
+    if row.get("status"):
+        explicit["metadata"]["status"] = {"status": status}
+    if row.get("policy_tags"):
+        explicit["metadata"]["policyTags"] = tags
+    if row.get("time_zone"):
+        explicit["metadata"]["timeZone"] = time_zone
+    if row.get("start_date") or row.get("end_date"):
+        explicit["metadata"]["timeFrame"] = time_frame
+
+    spec["explicit"] = explicit
+    spec["connect_as"] = connect_as
+    spec["conditions"] = conditions
+    spec["metadata"] = {
+        "name": name, "description": description, "status": {"status": status},
+        "timeFrame": time_frame,
+        "policyEntitlement": {"targetCategory": TARGET_CATEGORY_VM,
+                              "locationType": location,
+                              "policyType": POLICY_TYPE_RECURRING},
+        "policyTags": tags, "timeZone": time_zone,
+    }
+    spec["default_principals"] = list(d.get("principals") or [])
+    return spec
+
+
+def build_changes(rows: list[dict[str, str]], cfg: Config
+                  ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    """Group row specs by policy name, preserving CSV order."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    display: dict[str, str] = {}
     cond_seen: dict[str, str] = {}
     errors: list[str] = []
-
     for idx, row in enumerate(rows, start=2):
         try:
-            name = row.get("policy_name", "").strip()
-            if not name:
-                raise BuildError("policy_name is required")
-            if len(name) > MAX_NAME:
-                raise BuildError(f"policy_name exceeds {MAX_NAME} chars")
-
-            location = row.get("location_type") or d.get("location_type") or LOCATION_FQDN_IP
-            if location not in LOCATION_TYPES:
-                raise BuildError(f"location_type must be one of {sorted(LOCATION_TYPES)}")
-
-            # targets
-            pattern = row.get("computername_pattern", "").strip()
-            ips = _split(row.get("ip_addresses", ""))
-            if not pattern and not ips:
-                raise BuildError("row needs computername_pattern or ip_addresses")
-            fqdn_rules, ip_rules = [], []
-            if pattern:
-                op = (row.get("fqdn_operator") or d.get("fqdn_operator") or "EXACTLY").upper()
-                if op not in FQDN_OPERATORS:
-                    raise BuildError(f"fqdn_operator must be one of {sorted(FQDN_OPERATORS)}")
-                if len(pattern) > MAX_PATTERN:
-                    raise BuildError(f"computername_pattern exceeds {MAX_PATTERN} chars")
-                rule: dict[str, Any] = {"operator": op, "computernamePattern": pattern}
-                dom = row.get("domain") or d.get("domain") or ""
-                if dom:
-                    rule["domain"] = dom
-                fqdn_rules.append(rule)
-            if ips:
-                op = (row.get("ip_operator") or "EXACTLY").upper()
-                if op not in IP_OPERATORS:
-                    raise BuildError(f"ip_operator must be one of {sorted(IP_OPERATORS)}")
-                logical = row.get("logical_name") or d.get("logical_name") or ""
-                if not logical:
-                    raise BuildError("ip_addresses requires logical_name")
-                ip_rules.append({"operator": op, "ipAddresses": ips, "logicalName": logical})
-
-            # principals (names now; resolved later)
-            wanted = _split(row.get("principals", "")) or list(d.get("principals") or [])
-            if not wanted:
-                raise BuildError("row needs principals (semicolon separated)")
-
-            # behavior
-            connect_as: dict[str, Any] = {}
-            ssh_user = row.get("ssh_username") or d.get("ssh_username") or ""
-            if ssh_user:
-                connect_as["ssh"] = {"username": ssh_user}
-            if _bool(row.get("rdp"), _bool(d.get("rdp"), False)) or row.get("rdp_scope"):
-                scope = (row.get("rdp_scope") or d.get("rdp_scope") or "local").lower()
-                groups = _split(row.get("rdp_groups", "")) or list(
-                    d.get("rdp_groups") or ["Administrators"])
-                dgroups = _split(row.get("rdp_domain_groups", ""))
-                recon = _bool(row.get("rdp_reconnect"), _bool(d.get("rdp_reconnect"), False))
-                if scope == "local":
-                    if dgroups:
-                        raise BuildError("rdp_domain_groups requires rdp_scope=domain")
-                    connect_as["rdp"] = {"localEphemeralUser": {
-                        "assignGroups": groups,
-                        "enableEphemeralUserReconnect": recon}}
-                elif scope == "domain":
-                    connect_as["rdp"] = {"domainEphemeralUser": {
-                        "assignGroups": groups,
-                        "assignDomainGroups": dgroups,
-                        "enableEphemeralUserReconnect": recon}}
-                else:
-                    raise BuildError("rdp_scope must be 'local' or 'domain'")
-            if not connect_as:
-                raise BuildError("row needs ssh_username, or rdp=true / rdp_scope")
-
-            # conditions
-            day_names = _split(row.get("days_of_week", "")) or list(d.get("days_of_week") or [])
-            if day_names:
-                bad = [x for x in day_names if x not in days_lookup]
-                if bad:
-                    raise BuildError(f"unknown days {bad}; expected from {list(days_lookup)}")
-                days = sorted(days_lookup[x] for x in day_names)
-            else:
-                days = list(range(7))
-            # "All Day" in the UI is null hours, NOT 00:00-23:59. Sending
-            # 00:00-23:59 selects "Specific time" and the UI snaps each value
-            # to the nearest hour. Blank cells, or all_day=true, mean all day.
-            all_day = _bool(row.get("all_day"), _bool(d.get("all_day"), False))
-            raw_from = row.get("from_hour") or d.get("from_hour") or ""
-            raw_to = row.get("to_hour") or d.get("to_hour") or ""
-            if all_day or not (raw_from and raw_to):
-                # How the API wants "All Day" is not documented and the GET
-                # response (null) does not prove what POST accepts: CyberArk's
-                # own Go SDK types these as plain strings, which cannot be null
-                # and marshal as "". Switchable so it can be tested directly.
-                from_hour = to_hour = (None if cfg.all_day_repr == "null"
-                                       else "" if cfg.all_day_repr == "empty"
-                                       else "OMIT")
-            else:
-                from_hour = _hhmm(raw_from, "from_hour")
-                to_hour = _hhmm(raw_to, "to_hour")
-            duration = _int(row.get("max_session_duration"),
-                            int(d.get("max_session_duration", 2)))
-            idle = _int(row.get("idle_time"), int(d.get("idle_time", 10)))
-            if not 0 < duration <= MAX_SESSION_HOURS:
-                raise BuildError(f"max_session_duration must be 1..{MAX_SESSION_HOURS}")
-            if not 0 < idle <= MAX_IDLE_MIN:
-                raise BuildError(f"idle_time must be 1..{MAX_IDLE_MIN}")
-            window: dict[str, Any] = {"daysOfTheWeek": days}
-            if from_hour != "OMIT":
-                window["fromHour"] = from_hour
-                window["toHour"] = to_hour
-            conditions = {
-                "accessWindow": window,
-                "maxSessionDuration": duration,
-                "idleTime": idle,
-            }
-
-            status = row.get("status") or d.get("status") or "Active"
-            if status not in STATUSES:
-                raise BuildError(f"status must be one of {sorted(STATUSES)}")
-
-            body = grouped.get(name)
-            if body is None:
-                body = {
-                    "metadata": {
-                        "name": name,
-                        "description": (row.get("description")
-                                        or d.get("description") or "")[:MAX_DESCRIPTION],
-                        "status": {"status": status},
-                        "timeFrame": {"fromTime": row.get("start_date") or None,
-                                      "toTime": row.get("end_date") or None},
-                        "policyEntitlement": {
-                            "targetCategory": TARGET_CATEGORY_VM,
-                            "locationType": location,
-                            "policyType": POLICY_TYPE_RECURRING},
-                        "policyTags": _split(row.get("policy_tags", ""))
-                                      or list(d.get("policy_tags") or []),
-                        "timeZone": row.get("time_zone") or d.get("time_zone") or "UTC",
-                    },
-                    "principals": list(wanted),          # names; swapped for objects later
-                    "conditions": conditions,
-                    "behavior": {"connectAs": connect_as},
-                    "targets": {location: {"fqdnRules": fqdn_rules, "ipRules": ip_rules}},
-                }
-                grouped[name] = body
-                order.append(name)
-                cond_seen[name] = json.dumps(conditions, sort_keys=True)
-            else:
-                block = body["targets"].setdefault(location,
-                                                   {"fqdnRules": [], "ipRules": []})
-                for r in fqdn_rules:
-                    if r not in block["fqdnRules"]:
-                        block["fqdnRules"].append(r)
-                for r in ip_rules:
-                    if r not in block["ipRules"]:
-                        block["ipRules"].append(r)
-                for p in wanted:
-                    if p not in body["principals"]:
-                        body["principals"].append(p)
-                if cond_seen[name] != json.dumps(conditions, sort_keys=True):
-                    raise BuildError(
-                        f"policy {name!r} already has different conditions from an earlier "
-                        f"row. UAP allows one access window per policy; split these into "
-                        f"separate policy_names.")
+            spec = parse_row(row, cfg)
         except (BuildError, ValueError) as exc:
             errors.append(f"row {idx}: {exc}")
+            continue
+        spec["line"] = idx
+        key = spec["name"].casefold()
+        display.setdefault(key, spec["name"])
+        spec["name"] = display[key]
+        if spec["action"] == "add":
+            sig = json.dumps(spec["conditions"], sort_keys=True)
+            if key in cond_seen and cond_seen[key] != sig:
+                errors.append(
+                    f"row {idx}: policy {spec['name']!r} already has different conditions "
+                    f"from an earlier row. UAP allows one access window per policy; "
+                    f"make the rows agree or split into separate policy_names.")
+                continue
+            cond_seen.setdefault(key, sig)
+        grouped.setdefault(spec["name"], []).append(spec)
+    return grouped, errors
 
-    return [grouped[n] for n in order], errors
+
+def create_body(specs: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, list[str]]:
+    """Full policy body from the add rows. Used for CREATE and --replace."""
+    adds = [s for s in specs if s["action"] == "add"]
+    if not adds:
+        return None, ["no add rows for this policy"]
+    first = adds[0]
+    targets: dict[str, dict[str, list]] = {}
+    principals: list[str] = []
+    connect_as: dict[str, Any] = {}
+    for s in adds:
+        block = targets.setdefault(s["location"], {"fqdnRules": [], "ipRules": []})
+        for r in s["fqdn_rules"]:
+            if r not in block["fqdnRules"]:
+                block["fqdnRules"].append(r)
+        for r in s["ip_rules"]:
+            if r not in block["ipRules"]:
+                block["ipRules"].append(r)
+        for p in s["principals"] or s["default_principals"]:
+            if p not in principals:
+                principals.append(p)
+        for k, v in s["connect_as"].items():
+            connect_as.setdefault(k, v)
+    targets = {k: v for k, v in targets.items() if v["fqdnRules"] or v["ipRules"]}
+    problems = []
+    if not targets:
+        problems.append("needs at least one computername_pattern or ip_addresses")
+    if not principals:
+        problems.append("needs principals")
+    if not connect_as:
+        problems.append("needs ssh_username or rdp=true / rdp_scope")
+    body = {"metadata": copy.deepcopy(first["metadata"]),
+            "principals": principals,
+            "conditions": copy.deepcopy(first["conditions"]),
+            "behavior": {"connectAs": connect_as},
+            "targets": targets}
+    return body, problems
 
 
 def validate_body(body: dict[str, Any]) -> list[str]:
@@ -945,6 +1032,182 @@ def merge_for_update(live: dict[str, Any], desired: dict[str, Any]) -> dict[str,
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# Merge mode: apply add/remove rows onto a live policy
+# ---------------------------------------------------------------------------
+
+PRINCIPAL_FIELDS = ("id", "name", "type", "sourceDirectoryName", "sourceDirectoryId")
+PUT_METADATA = ("policyId", "name", "description", "policyEntitlement",
+                "policyTags", "timeZone", "timeFrame")
+
+
+def put_shape(live: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a full GET /policies/{id} to the shape PUT accepts.
+
+    Same fields the CSV-built body carries, so server-managed extras like
+    delegationClassification never go back (those caused the 500s).
+    """
+    m = live.get("metadata") or {}
+    st = m.get("status")
+    status = st.get("status") if isinstance(st, dict) else st
+    meta = {k: copy.deepcopy(m[k]) for k in PUT_METADATA if k in m}
+    meta["status"] = {"status": status or "Active"}
+    c = live.get("conditions") or {}
+    cond = {"accessWindow": copy.deepcopy(c.get("accessWindow") or {}),
+            "maxSessionDuration": c.get("maxSessionDuration"),
+            "idleTime": c.get("idleTime")}
+    principals = [{k: p[k] for k in PRINCIPAL_FIELDS if p.get(k)}
+                  for p in (live.get("principals") or []) if isinstance(p, dict)]
+    return {"metadata": meta, "principals": principals, "conditions": cond,
+            "behavior": copy.deepcopy(live.get("behavior") or {}),
+            "targets": copy.deepcopy(live.get("targets") or {})}
+
+
+def _cf(v: Any) -> str:
+    return str(v or "").casefold()
+
+
+def _fqdn_label(r: dict[str, Any]) -> str:
+    host = r.get("computernamePattern", "")
+    if r.get("domain"):
+        host = f"{host}.{r['domain']}"
+    return f"{r.get('operator') or 'ANY'} {host}"
+
+
+def _fqdn_same(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    return (_cf(a.get("operator")) == _cf(b.get("operator"))
+            and _cf(a.get("computernamePattern")) == _cf(b.get("computernamePattern"))
+            and _cf(a.get("domain")) == _cf(b.get("domain")))
+
+
+def _blocks(targets: dict[str, Any], location: str) -> dict[str, list]:
+    block = targets.get(location)
+    if not isinstance(block, dict):
+        block = targets[location] = {}
+    block["fqdnRules"] = list(block.get("fqdnRules") or [])
+    block["ipRules"] = list(block.get("ipRules") or [])
+    return block
+
+
+def merge_existing(live: dict[str, Any], specs: list[dict[str, Any]],
+                   resolved: dict[str, dict[str, str]]
+                   ) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Returns (put body, change notes, warnings). No notes = nothing to push."""
+    body = put_shape(live)
+    notes: list[str] = []
+    warns: list[str] = []
+    targets = body["targets"]
+    plist = body["principals"]
+
+    for s in specs:
+        tag = f"row {s['line']}"
+        if s["action"] == "add":
+            block = _blocks(targets, s["location"])
+            for r in s["fqdn_rules"]:
+                if any(_fqdn_same(x, r) for x in block["fqdnRules"]):
+                    continue
+                block["fqdnRules"].append(r)
+                notes.append(f"    targets    + {_fqdn_label(r)}")
+            for r in s["ip_rules"]:
+                home = next((x for x in block["ipRules"]
+                             if _cf(x.get("logicalName")) == _cf(r["logicalName"])
+                             and _cf(x.get("operator")) == _cf(r["operator"])), None)
+                if home is None:
+                    block["ipRules"].append(copy.deepcopy(r))
+                    for ip in r["ipAddresses"]:
+                        notes.append(f"    targets    + {ip} ({r['logicalName']})")
+                    continue
+                home["ipAddresses"] = list(home.get("ipAddresses") or [])
+                for ip in r["ipAddresses"]:
+                    if ip not in home["ipAddresses"]:
+                        home["ipAddresses"].append(ip)
+                        notes.append(f"    targets    + {ip} ({r['logicalName']})")
+            for n in s["principals"]:
+                p = resolved[n]
+                if any(x.get("id") == p["id"] for x in plist):
+                    continue
+                plist.append(copy.deepcopy(p))
+                notes.append(f"    principals + {n}")
+            ex = s["explicit"]
+            aw = body["conditions"]["accessWindow"]
+            for k, v in ex["accessWindow"].items():
+                # "" and null both mean All Day; keep whichever the tenant stores
+                if not (v in ("", None) and aw.get(k) in ("", None) and k in aw):
+                    aw[k] = v
+            body["conditions"].update(ex["conditions"])
+            body["behavior"].setdefault("connectAs", {}).update(copy.deepcopy(ex["connectAs"]))
+            body["metadata"].update(copy.deepcopy(ex["metadata"]))
+            continue
+
+        # ---- remove ------------------------------------------------------
+        for r in s["fqdn_rules"]:
+            hit = False
+            for loc in list(targets):
+                block = _blocks(targets, loc)
+                keep = []
+                for x in block["fqdnRules"]:
+                    match = (_cf(x.get("computernamePattern")) == _cf(r["computernamePattern"])
+                             and (r["operator"] is None
+                                  or _cf(x.get("operator")) == _cf(r["operator"]))
+                             and (r["domain"] is None
+                                  or _cf(x.get("domain")) == _cf(r["domain"])))
+                    if match:
+                        hit = True
+                        notes.append(f"    targets    - {_fqdn_label(x)}")
+                    else:
+                        keep.append(x)
+                block["fqdnRules"] = keep
+            if not hit:
+                warns.append(f"{tag}: target {r['computernamePattern']!r} not on policy, skipped")
+        for r in s["ip_rules"]:
+            for ip in r["ipAddresses"]:
+                hit = False
+                for loc in list(targets):
+                    block = _blocks(targets, loc)
+                    for x in block["ipRules"]:
+                        if r["logicalName"] and _cf(x.get("logicalName")) != _cf(r["logicalName"]):
+                            continue
+                        if ip in (x.get("ipAddresses") or []):
+                            x["ipAddresses"] = [i for i in x["ipAddresses"] if i != ip]
+                            hit = True
+                            notes.append(f"    targets    - {ip} ({x.get('logicalName')})")
+                    block["ipRules"] = [x for x in block["ipRules"] if x.get("ipAddresses")]
+                if not hit:
+                    warns.append(f"{tag}: ip {ip} not on policy, skipped")
+        for n in s["principals"]:
+            pid = (resolved.get(n) or {}).get("id")
+            before = len(plist)
+            plist[:] = [x for x in plist
+                        if not ((pid and x.get("id") == pid) or _cf(x.get("name")) == _cf(n))]
+            if len(plist) == before:
+                warns.append(f"{tag}: principal {n!r} not on policy, skipped")
+            else:
+                notes.append(f"    principals - {n}")
+
+    # drop empty target blocks we may have created or emptied
+    for loc in list(targets):
+        b = targets[loc]
+        if not (b.get("fqdnRules") or b.get("ipRules")):
+            del targets[loc]
+
+    live_shape = put_shape(live)
+    for section in ("metadata", "conditions", "behavior"):
+        _leaf_diff(live_shape.get(section), body.get(section), section, notes,
+                   skip=SERVER_OWNED_METADATA)
+    return body, notes, warns
+
+
+def _norm(value: Any) -> Any:
+    """Drop null keys and sort dict lists so server reordering is not a change."""
+    if isinstance(value, dict):
+        return {k: _norm(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        items = [_norm(v) for v in value]
+        return sorted(items, key=lambda x: json.dumps(x, sort_keys=True))
+    return value
+
+
 def _leaf_diff(live: Any, desired: Any, path: str, out: list[str],
                skip: set[str] | None = None) -> None:
     if isinstance(live, dict) and isinstance(desired, dict):
@@ -956,10 +1219,12 @@ def _leaf_diff(live: Any, desired: Any, path: str, out: list[str],
             _leaf_diff(live.get(key), desired.get(key),
                        f"{path}.{key}" if path else key, out, skip)
         return
-    if path in ORDER_INSENSITIVE and isinstance(live, list) and isinstance(desired, list):
-        if sorted(map(str, live)) == sorted(map(str, desired)):
+    if live in ("", None) and desired in ("", None):
+        return
+    if isinstance(live, list) and isinstance(desired, list):
+        if _norm(live) == _norm(desired):
             return
-        out.append(f"    {path}: {_short(sorted(live))} -> {_short(sorted(desired))}")
+        out.append(f"    {path}: {_short(_norm(live))} -> {_short(_norm(desired))}")
         return
     if live != desired:
         out.append(f"    {path}: {_short(live)} -> {_short(desired)}")
@@ -973,17 +1238,20 @@ def _short(value: Any) -> str:
 
 
 def diff_summary(live: dict[str, Any], desired: dict[str, Any]) -> list[str]:
-    """Leaf-level diff, ignoring fields the server owns."""
+    """Leaf-level diff for --replace mode, ignoring fields the server owns."""
     notes: list[str] = []
     lp = {(p.get("id"), p.get("name")) for p in (live.get("principals") or [])
           if isinstance(p, dict)}
     dp = {(p.get("id"), p.get("name")) for p in (desired.get("principals") or [])
           if isinstance(p, dict)}
-    for _, name in sorted(dp - lp, key=lambda x: str(x[1])):
-        notes.append(f"    principals + {name}")
-    for _, name in sorted(lp - dp, key=lambda x: str(x[1])):
-        notes.append(f"    principals - {name}")
-
+    lids = {i for i, _ in lp}
+    dids = {i for i, _ in dp}
+    for pid, name in sorted(dp, key=lambda x: str(x[1])):
+        if pid not in lids:
+            notes.append(f"    principals + {name}")
+    for pid, name in sorted(lp, key=lambda x: str(x[1])):
+        if pid not in dids:
+            notes.append(f"    principals - {name}")
     for section in ("metadata", "conditions", "behavior", "targets"):
         _leaf_diff(live.get(section), desired.get(section), section, notes,
                    skip=SERVER_OWNED_METADATA)
@@ -999,11 +1267,14 @@ def main(argv: list[str] | None = None) -> int:
         description="Build and push CyberArk UAP virtual machine (ZSP) policies.")
     ap.add_argument("--apply", action="store_true",
                     help="actually create or update (default is plan, no writes)")
+    ap.add_argument("--replace", action="store_true",
+                    help="CSV is the full truth: anything on a policy not in the CSV is "
+                         "removed. Default is merge (add/remove only what rows say).")
     ap.add_argument("--config", default=CONFIG_NAME)
     ap.add_argument("--discover", metavar="SUBDOMAIN", nargs="?", const="",
                     help="list this tenant's real service URLs and exit")
     ap.add_argument("--dump-body", action="store_true",
-                    help="print the exact JSON this would send, then exit")
+                    help="print the parsed CSV changes as JSON, then exit")
     ap.add_argument("--dump-policy", metavar="NAME",
                     help="print a live policy as JSON and exit "
                          "(use it to see the exact shape the tenant stores)")
@@ -1036,9 +1307,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     set_verify(cfg.verify())
+    replace = args.replace or cfg.mode == "replace"
 
     mode = "APPLY" if args.apply else "PLAN (no writes)"
-    print(f"mode     : {mode}")
+    print(f"mode     : {mode}, {'REPLACE (CSV is full truth)' if replace else 'MERGE (add/remove)'}")
     print(f"tenant   : {cfg.tenant_url}")
     print(f"uap      : {cfg.uap_url}")
     print(f"policies : {cfg.policies_file.name}")
@@ -1063,39 +1335,50 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(match, indent=2))
         return 0
 
-    # --- build bodies from CSV (offline) ---------------------------------
+    # --- parse CSV (offline) ---------------------------------------------
     try:
         rows = load_rows(cfg.policies_file)
     except BuildError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    bodies, errors = build_bodies(rows, cfg)
+    changes, errors = build_changes(rows, cfg)
+    if replace:
+        for name, specs in changes.items():
+            for s in specs:
+                if s["action"] == "remove":
+                    errors.append(f"row {s['line']}: action=remove is not allowed with "
+                                  f"--replace (just leave the entry out of the CSV)")
     if errors:
         print(f"{len(errors)} problem(s) in {cfg.policies_file.name}, nothing pushed:",
               file=sys.stderr)
         for e in errors:
             print(f"  {e}", file=sys.stderr)
         return 1
-    print(f"built {len(bodies)} polic{'y' if len(bodies) == 1 else 'ies'} "
-          f"from {len(rows)} row(s)")
+    n_add = sum(s["action"] == "add" for v in changes.values() for s in v)
+    n_rm = sum(s["action"] == "remove" for v in changes.values() for s in v)
+    print(f"parsed {len(rows)} row(s): {n_add} add, {n_rm} remove, "
+          f"{len(changes)} polic{'y' if len(changes) == 1 else 'ies'}")
 
     if args.dump_body and not args.apply:
-        print(json.dumps(bodies, indent=2))
-        print("\n(principals are still names here; they are resolved next)",
-              file=sys.stderr)
+        print(json.dumps(changes, indent=2))
         return 0
 
     # --- resolve principals ----------------------------------------------
-    names: list[str] = []
-    for b in bodies:
-        for n in b["principals"]:
-            if n not in names:
-                names.append(n)
+    hard: list[str] = []      # add rows / creates: must resolve
+    soft: list[str] = []      # remove-only: can fall back to name match
+    for specs in changes.values():
+        for s in specs:
+            names = s["principals"] + (s.get("default_principals") or [])
+            for n in names:
+                bucket = hard if s["action"] == "add" else soft
+                if n not in bucket:
+                    bucket.append(n)
+    soft = [n for n in soft if n not in hard]
 
     try:
         identity = IdentityClient(cfg.tenant_url, cfg.client_id, cfg.secret())
         identity.authenticate()
-        dir_map = identity.directory_map(cfg.directory_labels)
+        dir_map = identity.directory_map(cfg.directory_labels) if (hard or soft) else {}
     except requests.exceptions.SSLError as exc:
         print(f"\n{exc}\n{ssl_hint()}", file=sys.stderr)
         return 2
@@ -1103,13 +1386,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{exc}", file=sys.stderr)
         return 2
 
-    print(f"\nresolving {len(names)} principal(s):")
     resolved: dict[str, dict[str, str]] = {}
     failures: list[str] = []
-    for n in names:
+    if hard or soft:
+        print(f"\nresolving {len(hard) + len(soft)} principal(s):")
+    for n in hard + soft:
         try:
             p = resolve_one(identity, n, dir_map, cfg)
         except (ResolveError, requests.RequestException) as exc:
+            if n in soft:
+                print(f"  ~~  {n}  (not found, will match by name for removal)")
+                continue
             failures.append(f"{n}: {exc}")
             print(f"  !!  {n}")
             continue
@@ -1117,7 +1404,6 @@ def main(argv: list[str] | None = None) -> int:
         if cfg.keep_input_name:
             entry["name"] = n
         entry["type"] = UAP_PRINCIPAL_TYPE.get(p.type, p.type.upper())
-        # An empty string here fails UAP1005 validation. Omit instead.
         for field in ("sourceDirectoryName", "sourceDirectoryId"):
             if not entry.get(field):
                 entry.pop(field, None)
@@ -1137,18 +1423,6 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.unresolved_file and cfg.unresolved_file.exists():
         cfg.unresolved_file.unlink()
 
-    for b in bodies:
-        b["principals"] = [resolved[n] for n in b["principals"]]
-
-    bad = [(b["metadata"]["name"], validate_body(b)) for b in bodies]
-    bad = [(n, p) for n, p in bad if p]
-    if bad:
-        print("\nvalidation failed, nothing pushed:", file=sys.stderr)
-        for n, probs in bad:
-            for p in probs:
-                print(f"  {n}: {p}", file=sys.stderr)
-        return 1
-
     # --- compare against live --------------------------------------------
     uap = UapClient(cfg.uap_url, identity)
     try:
@@ -1166,23 +1440,70 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     plan: list[tuple[str, dict[str, Any], str, str]] = []
+    blocked: list[str] = []
     print()
-    for b in bodies:
-        name = b["metadata"]["name"]
-        live = live_index.get(name.casefold())
-        if live is None:
+    for name, specs in changes.items():
+        summary = live_index.get(name.casefold())
+
+        if summary is None:
+            removes = [s for s in specs if s["action"] == "remove"]
+            body, probs = create_body(specs)
+            if removes and body is None:
+                print(f"  skip    {name}  (does not exist, only remove rows)")
+                continue
+            for s in removes:
+                print(f"  warn    row {s['line']}: remove ignored, {name!r} does not exist yet")
+            if probs:
+                blocked += [f"{name}: cannot create, {p}" for p in probs]
+                continue
+            body["principals"] = [resolved[n] for n in body["principals"]]
+            probs = validate_body(body)
+            if probs:
+                blocked += [f"{name}: {p}" for p in probs]
+                continue
             print(f"  CREATE  {name}")
-            plan.append(("create", b, name, ""))
+            plan.append(("create", body, name, ""))
             continue
-        pid = uap.policy_id(live)
-        notes = diff_summary(live, b)
+
+        pid = uap.policy_id(summary)
+        try:
+            live = uap.get_policy(pid) if pid else summary
+        except (PushError, requests.RequestException) as exc:
+            blocked.append(f"{name}: could not read live policy: {exc}")
+            continue
+        live = live or summary
+
+        if replace:
+            body, probs = create_body(specs)
+            if probs:
+                blocked += [f"{name}: {p}" for p in probs]
+                continue
+            body["principals"] = [resolved[n] for n in body["principals"]]
+            body["metadata"]["policyId"] = pid
+            notes = diff_summary(live, body)
+            warns: list[str] = []
+        else:
+            body, notes, warns = merge_existing(live, specs, resolved)
+
+        for w in warns:
+            print(f"  warn    {w}")
+        probs = validate_body(body)
+        if probs:
+            blocked += [f"{name}: after changes, {p}" for p in probs]
+            continue
         if not notes:
             print(f"  ok      {name}  (already matches)")
             continue
         print(f"  UPDATE  {name}  (id {pid or '?'})")
         for line in notes:
             print(line)
-        plan.append(("update", b, name, pid))
+        plan.append(("update", body, name, pid))
+
+    if blocked:
+        print("\nblocked, nothing pushed:", file=sys.stderr)
+        for b in blocked:
+            print(f"  {b}", file=sys.stderr)
+        return 1
 
     if not plan:
         print("\nnothing to do.")
@@ -1203,9 +1524,7 @@ def main(argv: list[str] | None = None) -> int:
                     body = gui_style_body({}, body)
 
                 # POST rejects null fromHour/toHour (UAP1005) but PUT accepts
-                # them, which is how the GUI's "All Day" is stored. So an
-                # all-day policy is created with placeholder hours and then
-                # immediately updated to null.
+                # them. Create with placeholder hours, then PUT null.
                 window = ((body.get("conditions") or {}).get("accessWindow") or {})
                 needs_all_day = ("fromHour" in window and window["fromHour"] is None)
                 if needs_all_day:
